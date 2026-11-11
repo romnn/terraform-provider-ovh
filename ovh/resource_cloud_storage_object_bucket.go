@@ -21,6 +21,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/ovh/go-ovh/ovh"
+	"github.com/ovh/terraform-provider-ovh/v2/ovh/helpers"
+	"github.com/ovh/terraform-provider-ovh/v2/ovh/ovhwrap"
 	ovhtypes "github.com/ovh/terraform-provider-ovh/v2/ovh/types"
 )
 
@@ -526,18 +528,13 @@ func (r *cloudStorageObjectBucketResource) Create(ctx context.Context, req resou
 		return
 	}
 
-	endpoint = "/v2/publicCloud/project/" + url.PathEscape(data.ServiceName.ValueString()) + "/storage/object/bucket/" + url.PathEscape(responseData.Id)
-	// json.Unmarshal merges into a non-zero struct: stale map keys/pointers would leak.
-	responseData = CloudStorageObjectBucketAPIResponse{}
-	if err := r.config.OVHClient.Get(endpoint, &responseData); err != nil {
-		resp.Diagnostics.AddError(
-			fmt.Sprintf("Error calling Get %s", endpoint),
-			err.Error(),
-		)
+	created, err := getStorageObjectBucket(ctx, r.config.OVHClient, data.ServiceName.ValueString(), responseData.Id)
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading the created bucket", err.Error())
 		return
 	}
 
-	data.MergeWith(ctx, &responseData)
+	data.MergeWith(ctx, created)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -550,22 +547,17 @@ func (r *cloudStorageObjectBucketResource) Read(ctx context.Context, req resourc
 		return
 	}
 
-	endpoint := "/v2/publicCloud/project/" + url.PathEscape(data.ServiceName.ValueString()) + "/storage/object/bucket/" + url.PathEscape(data.Id.ValueString())
-
-	var responseData CloudStorageObjectBucketAPIResponse
-	if err := r.config.OVHClient.Get(endpoint, &responseData); err != nil {
+	responseData, err := getStorageObjectBucket(ctx, r.config.OVHClient, data.ServiceName.ValueString(), data.Id.ValueString())
+	if err != nil {
 		if errOvh, ok := err.(*ovh.APIError); ok && errOvh.Code == 404 {
 			resp.State.RemoveResource(ctx)
 			return
 		}
-		resp.Diagnostics.AddError(
-			fmt.Sprintf("Error calling Get %s", endpoint),
-			err.Error(),
-		)
+		resp.Diagnostics.AddError("Error reading the bucket", err.Error())
 		return
 	}
 
-	data.MergeWith(ctx, &responseData)
+	data.MergeWith(ctx, responseData)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -604,16 +596,13 @@ func (r *cloudStorageObjectBucketResource) Update(ctx context.Context, req resou
 		return
 	}
 
-	responseData = CloudStorageObjectBucketAPIResponse{}
-	if err := r.config.OVHClient.Get(endpoint, &responseData); err != nil {
-		resp.Diagnostics.AddError(
-			fmt.Sprintf("Error calling Get %s", endpoint),
-			err.Error(),
-		)
+	updated, err := getStorageObjectBucket(ctx, r.config.OVHClient, data.ServiceName.ValueString(), data.Id.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Error reading the updated bucket", err.Error())
 		return
 	}
 
-	planData.MergeWith(ctx, &responseData)
+	planData.MergeWith(ctx, updated)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &planData)...)
 }
@@ -675,11 +664,13 @@ func (r *cloudStorageObjectBucketResource) waitForStorageObjectBucketReady(ctx c
 		Pending: []string{"CREATING", "UPDATING", "PENDING", "OUT_OF_SYNC", "UNKNOWN"},
 		Target:  []string{"READY"},
 		Refresh: func() (any, string, error) {
-			res := &CloudStorageObjectBucketAPIResponse{}
-			endpoint := "/v2/publicCloud/project/" + url.PathEscape(serviceName) + "/storage/object/bucket/" + url.PathEscape(bucketId)
-			err := r.config.OVHClient.GetWithContext(ctx, endpoint, res)
+			res, err := getStorageObjectBucket(ctx, r.config.OVHClient, serviceName, bucketId)
 			if err != nil {
-				return res, "", err
+				// Right after the POST, even the bucket list can lack the new bucket for a while.
+				if errOvh, ok := err.(*ovh.APIError); ok && errOvh.Code == 404 {
+					return &CloudStorageObjectBucketAPIResponse{}, "CREATING", nil
+				}
+				return nil, "", err
 			}
 			// ERROR is terminal: surface it with the task reason instead of a generic unexpected-state.
 			if res.ResourceStatus == "ERROR" {
@@ -696,4 +687,33 @@ func (r *cloudStorageObjectBucketResource) waitForStorageObjectBucketReady(ctx c
 	}
 
 	return stateConf.WaitForStateContext(ctx)
+}
+
+// getStorageObjectBucket reads one bucket.
+// For minutes after a bucket is created, its single read can answer 404 at random while the bucket
+// list already reports it, so a 404 counts only when the list lacks the bucket too.
+// That 404 is returned as the *ovh.APIError of the single read, for callers to tell it apart.
+func getStorageObjectBucket(ctx context.Context, client *ovhwrap.Client, serviceName, bucketId string) (*CloudStorageObjectBucketAPIResponse, error) {
+	endpoint := "/v2/publicCloud/project/" + url.PathEscape(serviceName) + "/storage/object/bucket"
+
+	// json.Unmarshal merges into a non-zero struct, so every read starts from an empty one.
+	res := &CloudStorageObjectBucketAPIResponse{}
+	err := client.GetWithContext(ctx, endpoint+"/"+url.PathEscape(bucketId), res)
+	if err == nil {
+		return res, nil
+	}
+	if errOvh, ok := err.(*ovh.APIError); !ok || errOvh.Code != 404 {
+		return nil, fmt.Errorf("calling Get %s/%s: %w", endpoint, bucketId, err)
+	}
+
+	buckets, listErr := helpers.GetAllPagesV2[CloudStorageObjectBucketAPIResponse](ctx, client, endpoint)
+	if listErr != nil {
+		return nil, fmt.Errorf("bucket %s answered 404, and listing the buckets to confirm it failed: %w", bucketId, listErr)
+	}
+	for i := range buckets {
+		if buckets[i].Id == bucketId {
+			return &buckets[i], nil
+		}
+	}
+	return nil, err
 }
